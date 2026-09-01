@@ -1,6 +1,7 @@
 {
   "name": "bflix-bot",
   "version": "1.0.0",
+  "description": "BFlix Telegram Movie and Series Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
