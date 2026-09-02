@@ -2,7 +2,6 @@ const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
 
 const app = express();
-
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
 const PORT = process.env.PORT || 10000;
@@ -10,6 +9,9 @@ const TMDB_API_KEY = process.env.TMDB_API_KEY;
 
 const TMDB_BASE_URL = "https://api.themoviedb.org/3";
 const TMDB_IMAGE_URL = "https://image.tmdb.org/t/p/w500";
+
+// Algeria
+const WATCH_REGION = "DZ";
 
 // ===============================
 // CHECK ENVIRONMENT VARIABLES
@@ -30,16 +32,15 @@ if (!TMDB_API_KEY) {
 const favorites = new Map();
 
 // ===============================
-// TMDB SEARCH
+// TMDB REQUEST
 // ===============================
 
-async function searchTMDB(query) {
+async function tmdbRequest(endpoint) {
+  const separator = endpoint.includes("?") ? "&" : "?";
+
   const url =
-    `${TMDB_BASE_URL}/search/multi` +
-    `?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
-    `&query=${encodeURIComponent(query)}` +
-    `&language=en-US` +
-    `&include_adult=false`;
+    `${TMDB_BASE_URL}${endpoint}` +
+    `${separator}api_key=${encodeURIComponent(TMDB_API_KEY)}`;
 
   const response = await fetch(url);
 
@@ -47,10 +48,23 @@ async function searchTMDB(query) {
     throw new Error(`TMDB API error: ${response.status}`);
   }
 
-  const data = await response.json();
+  return await response.json();
+}
+
+// ===============================
+// TMDB SEARCH
+// ===============================
+
+async function searchTMDB(query) {
+  const data = await tmdbRequest(
+    `/search/multi?query=${encodeURIComponent(query)}` +
+    `&language=en-US&include_adult=false`
+  );
 
   return (data.results || []).filter(
-    (item) => item.media_type === "movie" || item.media_type === "tv"
+    (item) =>
+      item.media_type === "movie" ||
+      item.media_type === "tv"
   );
 }
 
@@ -59,18 +73,9 @@ async function searchTMDB(query) {
 // ===============================
 
 async function getMovieDetails(id) {
-  const url =
-    `${TMDB_BASE_URL}/movie/${id}` +
-    `?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
-    `&language=en-US`;
-
-  const response = await fetch(url);
-
-  if (!response.ok) {
-    throw new Error(`TMDB movie error: ${response.status}`);
-  }
-
-  return await response.json();
+  return await tmdbRequest(
+    `/movie/${id}?language=en-US`
+  );
 }
 
 // ===============================
@@ -78,18 +83,19 @@ async function getMovieDetails(id) {
 // ===============================
 
 async function getTVDetails(id) {
-  const url =
-    `${TMDB_BASE_URL}/tv/${id}` +
-    `?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
-    `&language=en-US`;
+  return await tmdbRequest(
+    `/tv/${id}?language=en-US`
+  );
+}
 
-  const response = await fetch(url);
+// ===============================
+// GET WATCH PROVIDERS
+// ===============================
 
-  if (!response.ok) {
-    throw new Error(`TMDB TV error: ${response.status}`);
-  }
-
-  return await response.json();
+async function getWatchProviders(type, id) {
+  return await tmdbRequest(
+    `/${type}/${id}/watch/providers`
+  );
 }
 
 // ===============================
@@ -174,7 +180,7 @@ bot.on("text", async (ctx) => {
     if (results.length === 0) {
       return ctx.reply(
         `❌ No results found for "${query}".\n\n` +
-        `Try another movie or series name.`
+        `Try another title.`
       );
     }
 
@@ -211,14 +217,13 @@ bot.on("text", async (ctx) => {
     console.error("TMDB Search Error:", error);
 
     await ctx.reply(
-      "❌ An error occurred while searching TMDB.\n\n" +
-      "Please try again later."
+      "❌ An error occurred while searching TMDB."
     );
   }
 });
 
 // ===============================
-// TMDB MOVIE DETAILS
+// MOVIE DETAILS
 // ===============================
 
 bot.action(/^tmdb_movie_(\d+)$/, async (ctx) => {
@@ -226,9 +231,15 @@ bot.action(/^tmdb_movie_(\d+)$/, async (ctx) => {
 
   try {
     const movie = await getMovieDetails(ctx.match[1]);
+    const providers = await getWatchProviders(
+      "movie",
+      movie.id
+    );
 
     const title = movie.title || "Unknown";
-    const year = movie.release_date?.slice(0, 4) || "Unknown";
+    const year =
+      movie.release_date?.slice(0, 4) || "Unknown";
+
     const rating = movie.vote_average
       ? movie.vote_average.toFixed(1)
       : "N/A";
@@ -241,35 +252,85 @@ bot.action(/^tmdb_movie_(\d+)$/, async (ctx) => {
       ? `${TMDB_IMAGE_URL}${movie.poster_path}`
       : null;
 
+    const regionData =
+      providers.results?.[WATCH_REGION];
+
+    const buttons = [];
+
+    // Legal watch button
+    if (regionData?.link) {
+      buttons.push([
+        Markup.button.url(
+          "▶️ Watch legally",
+          regionData.link
+        )
+      ]);
+    }
+
+    buttons.push([
+      Markup.button.callback(
+        "⭐ Add to Favorites",
+        `tmdbfav_movie_${movie.id}`
+      )
+    ]);
+
+    buttons.push([
+      Markup.button.callback("⬅️ Back", "home")
+    ]);
+
+    let providerText = "";
+
+    if (regionData) {
+      const allProviders = [
+        ...(regionData.flatrate || []),
+        ...(regionData.free || []),
+        ...(regionData.ads || []),
+        ...(regionData.rent || []),
+        ...(regionData.buy || [])
+      ];
+
+      const uniqueProviders = [
+        ...new Map(
+          allProviders.map((p) => [p.provider_id, p])
+        ).values()
+      ];
+
+      if (uniqueProviders.length > 0) {
+        providerText =
+          `\n\n📺 Available providers:\n` +
+          uniqueProviders
+            .slice(0, 5)
+            .map((p) => `• ${p.provider_name}`)
+            .join("\n");
+      }
+    }
+
+    if (!regionData?.link) {
+      providerText +=
+        `\n\n⚠️ No legal streaming source was found for Algeria.`;
+    }
+
     const caption =
       `🎬 ${title}\n\n` +
       `📅 Release: ${year}\n` +
       `⭐ Rating: ${rating}/10\n\n` +
-      `📝 ${overview}\n\n` +
-      `🎞️ BFlix`;
-
-    const buttons = Markup.inlineKeyboard([
-      [
-        Markup.button.callback(
-          "⭐ Add to Favorites",
-          `tmdbfav_movie_${movie.id}`
-        )
-      ],
-      [
-        Markup.button.callback("⬅️ Back", "home")
-      ]
-    ]);
+      `📝 ${overview}` +
+      providerText +
+      `\n\n🎞️ BFlix`;
 
     if (poster) {
       await ctx.replyWithPhoto(
         { url: poster },
         {
           caption,
-          ...buttons
+          ...Markup.inlineKeyboard(buttons)
         }
       );
     } else {
-      await ctx.reply(caption, buttons);
+      await ctx.reply(
+        caption,
+        Markup.inlineKeyboard(buttons)
+      );
     }
 
   } catch (error) {
@@ -282,7 +343,7 @@ bot.action(/^tmdb_movie_(\d+)$/, async (ctx) => {
 });
 
 // ===============================
-// TMDB TV DETAILS
+// TV DETAILS
 // ===============================
 
 bot.action(/^tmdb_tv_(\d+)$/, async (ctx) => {
@@ -291,8 +352,15 @@ bot.action(/^tmdb_tv_(\d+)$/, async (ctx) => {
   try {
     const show = await getTVDetails(ctx.match[1]);
 
+    const providers = await getWatchProviders(
+      "tv",
+      show.id
+    );
+
     const title = show.name || "Unknown";
-    const year = show.first_air_date?.slice(0, 4) || "Unknown";
+
+    const year =
+      show.first_air_date?.slice(0, 4) || "Unknown";
 
     const rating = show.vote_average
       ? show.vote_average.toFixed(1)
@@ -306,35 +374,84 @@ bot.action(/^tmdb_tv_(\d+)$/, async (ctx) => {
       ? `${TMDB_IMAGE_URL}${show.poster_path}`
       : null;
 
+    const regionData =
+      providers.results?.[WATCH_REGION];
+
+    const buttons = [];
+
+    if (regionData?.link) {
+      buttons.push([
+        Markup.button.url(
+          "▶️ Watch legally",
+          regionData.link
+        )
+      ]);
+    }
+
+    buttons.push([
+      Markup.button.callback(
+        "⭐ Add to Favorites",
+        `tmdbfav_tv_${show.id}`
+      )
+    ]);
+
+    buttons.push([
+      Markup.button.callback("⬅️ Back", "home")
+    ]);
+
+    let providerText = "";
+
+    if (regionData) {
+      const allProviders = [
+        ...(regionData.flatrate || []),
+        ...(regionData.free || []),
+        ...(regionData.ads || []),
+        ...(regionData.rent || []),
+        ...(regionData.buy || [])
+      ];
+
+      const uniqueProviders = [
+        ...new Map(
+          allProviders.map((p) => [p.provider_id, p])
+        ).values()
+      ];
+
+      if (uniqueProviders.length > 0) {
+        providerText =
+          `\n\n📺 Available providers:\n` +
+          uniqueProviders
+            .slice(0, 5)
+            .map((p) => `• ${p.provider_name}`)
+            .join("\n");
+      }
+    }
+
+    if (!regionData?.link) {
+      providerText +=
+        `\n\n⚠️ No legal streaming source was found for Algeria.`;
+    }
+
     const caption =
       `📺 ${title}\n\n` +
       `📅 First aired: ${year}\n` +
       `⭐ Rating: ${rating}/10\n\n` +
-      `📝 ${overview}\n\n` +
-      `🎞️ BFlix`;
-
-    const buttons = Markup.inlineKeyboard([
-      [
-        Markup.button.callback(
-          "⭐ Add to Favorites",
-          `tmdbfav_tv_${show.id}`
-        )
-      ],
-      [
-        Markup.button.callback("⬅️ Back", "home")
-      ]
-    ]);
+      `📝 ${overview}` +
+      providerText +
+      `\n\n🎞️ BFlix`;
 
     if (poster) {
       await ctx.replyWithPhoto(
         { url: poster },
         {
           caption,
-          ...buttons
+          ...Markup.inlineKeyboard(buttons)
         }
       );
     } else {
-      await ctx.reply(caption, buttons);
+      await ctx.reply(
+        caption,
+        Markup.inlineKeyboard(buttons)
+      );
     }
 
   } catch (error) {
@@ -379,7 +496,7 @@ bot.action("movies", async (ctx) => {
 
   await ctx.editMessageText(
     `🎬 Movies\n\n` +
-    `Use the Search button to find any movie from TMDB.`,
+    `Search for any movie from TMDB.`,
     Markup.inlineKeyboard([
       [Markup.button.callback("🔎 Search Movies", "search")],
       [Markup.button.callback("⬅️ Back", "home")]
@@ -396,7 +513,7 @@ bot.action("series", async (ctx) => {
 
   await ctx.editMessageText(
     `📺 Series\n\n` +
-    `Use the Search button to find any series from TMDB.`,
+    `Search for any series from TMDB.`,
     Markup.inlineKeyboard([
       [Markup.button.callback("🔎 Search Series", "search")],
       [Markup.button.callback("⬅️ Back", "home")]
@@ -435,17 +552,9 @@ bot.action("trending", async (ctx) => {
   await ctx.answerCbQuery();
 
   try {
-    const url =
-      `${TMDB_BASE_URL}/trending/all/day` +
-      `?api_key=${encodeURIComponent(TMDB_API_KEY)}`;
-
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      throw new Error(`TMDB error: ${response.status}`);
-    }
-
-    const data = await response.json();
+    const data = await tmdbRequest(
+      "/trending/all/day"
+    );
 
     const results = (data.results || [])
       .filter(
