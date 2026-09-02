@@ -1,24 +1,30 @@
 const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
+const OpenAI = require("openai");
 
 const app = express();
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
 const PORT = process.env.PORT || 10000;
+
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-const TMDB_BASE_URL = "https://api.themoviedb.org/3";
-const TMDB_IMAGE_URL = "https://image.tmdb.org/t/p/w500";
+const openai = OPENAI_API_KEY
+  ? new OpenAI({
+      apiKey: OPENAI_API_KEY
+    })
+  : null;
 
-const IA_ADVANCED_SEARCH =
-  "https://archive.org/advancedsearch.php";
+const TMDB_BASE_URL =
+  "https://api.themoviedb.org/3";
 
-const IA_METADATA =
-  "https://archive.org/metadata/";
+const TMDB_IMAGE_URL =
+  "https://image.tmdb.org/t/p/w500";
 
 // ===============================
-// CHECK ENVIRONMENT VARIABLES
+// CHECK ENVIRONMENT
 // ===============================
 
 if (!process.env.BOT_TOKEN) {
@@ -29,11 +35,18 @@ if (!TMDB_API_KEY) {
   console.error("❌ TMDB_API_KEY is missing!");
 }
 
+if (!OPENAI_API_KEY) {
+  console.error("⚠️ OPENAI_API_KEY is missing!");
+}
+
 // ===============================
 // USER DATA
 // ===============================
 
 const favorites = new Map();
+
+const aiSupportUsers = new Set();
+const aiConversations = new Map();
 
 // ===============================
 // MAIN MENU
@@ -88,7 +101,7 @@ async function searchTMDB(query) {
 }
 
 // ===============================
-// GET MOVIE DETAILS
+// MOVIE DETAILS
 // ===============================
 
 async function getMovieDetails(id) {
@@ -107,7 +120,7 @@ async function getMovieDetails(id) {
 }
 
 // ===============================
-// GET TV DETAILS
+// TV DETAILS
 // ===============================
 
 async function getTVDetails(id) {
@@ -126,7 +139,7 @@ async function getTVDetails(id) {
 }
 
 // ===============================
-// TMDB WATCH PROVIDERS
+// WATCH PROVIDERS
 // ===============================
 
 async function getWatchProviders(type, id) {
@@ -137,125 +150,49 @@ async function getWatchProviders(type, id) {
   const response = await fetch(url);
 
   if (!response.ok) {
-    throw new Error(`Watch providers error: ${response.status}`);
+    throw new Error(
+      `Watch providers error: ${response.status}`
+    );
   }
 
   return await response.json();
 }
 
 // ===============================
-// INTERNET ARCHIVE SEARCH
+// WATCH BUTTONS
 // ===============================
 
-async function searchInternetArchive(query) {
-  const params = new URLSearchParams({
-    q: `title:("${query}") AND mediatype:movies`,
-    fl: "identifier,title,description,year",
-    rows: "10",
-    page: "1",
-    output: "json"
-  });
-
-  const response = await fetch(
-    `${IA_ADVANCED_SEARCH}?${params.toString()}`
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `Internet Archive error: ${response.status}`
-    );
-  }
-
-  const data = await response.json();
-
-  return data.response?.docs || [];
-}
-
-// ===============================
-// GET INTERNET ARCHIVE VIDEO
-// ===============================
-
-async function getInternetArchiveVideo(identifier) {
-  const response = await fetch(
-    `${IA_METADATA}${encodeURIComponent(identifier)}`
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `Internet Archive metadata error: ${response.status}`
-    );
-  }
-
-  const data = await response.json();
-
-  const files = data.files || [];
-
-  const videoExtensions = [
-    ".mp4",
-    ".webm",
-    ".ogv",
-    ".m4v"
-  ];
-
-  const videoFile = files.find((file) => {
-    const name = String(file.name || "").toLowerCase();
-
-    return videoExtensions.some((ext) =>
-      name.endsWith(ext)
-    );
-  });
-
-  if (!videoFile) {
-    return null;
-  }
-
-  return {
-    identifier,
-    filename: videoFile.name,
-    url:
-      `https://archive.org/download/` +
-      `${encodeURIComponent(identifier)}/` +
-      `${encodeURIComponent(videoFile.name)}`
-  };
-}
-
-// ===============================
-// BUILD WATCH BUTTONS
-// ===============================
-
-function buildWatchButtons(providers) {
+function buildWatchButtons(country) {
   const buttons = [];
 
-  const providerGroups = [
-    ["flatrate", "📺 Subscription"],
+  const groups = [
+    ["flatrate", "📺 Stream"],
     ["free", "🆓 Free"],
     ["ads", "📺 Free with Ads"],
     ["rent", "💳 Rent"],
     ["buy", "🛒 Buy"]
   ];
 
-  for (const [group, label] of providerGroups) {
-    const items = providers[group];
+  for (const [group, label] of groups) {
+    const providers = country[group];
 
-    if (!items || items.length === 0) {
+    if (!providers || !providers.length) {
       continue;
     }
 
-    const unique = [];
     const seen = new Set();
 
-    for (const provider of items) {
-      if (!seen.has(provider.provider_id)) {
-        seen.add(provider.provider_id);
-        unique.push(provider);
+    for (const provider of providers.slice(0, 4)) {
+      if (seen.has(provider.provider_id)) {
+        continue;
       }
-    }
 
-    for (const provider of unique.slice(0, 4)) {
+      seen.add(provider.provider_id);
+
       buttons.push([
         Markup.button.url(
           `${label}: ${provider.provider_name}`,
-          providers.link
+          country.link
         )
       ]);
     }
@@ -265,24 +202,40 @@ function buildWatchButtons(providers) {
 }
 
 // ===============================
-// /START
+// JUSTWATCH FALLBACK
+// ===============================
+
+function justWatchSearch(title) {
+  return (
+    `https://www.justwatch.com/search?q=` +
+    encodeURIComponent(title)
+  );
+}
+
+// ===============================
+// START
 // ===============================
 
 bot.start(async (ctx) => {
+  const userId = ctx.from.id;
+
+  aiSupportUsers.delete(userId);
+  aiConversations.delete(userId);
+
   await ctx.reply(
     `🎬 Welcome to BFlix!\n\n` +
     `🍿 Discover movies and series.\n` +
-    `🔎 Search for a title.\n` +
+    `🔎 Search for any title.\n` +
+    `⭐ Check ratings and details.\n` +
     `▶️ Find legal watch options.\n` +
-    `🔥 Explore trending titles.\n` +
-    `⭐ Save your favorites.\n\n` +
+    `🔥 Explore trending titles.\n\n` +
     `✨ Enjoy your cinematic experience!`,
     mainMenu()
   );
 });
 
 // ===============================
-// SEARCH BUTTON
+// SEARCH
 // ===============================
 
 bot.action("search", async (ctx) => {
@@ -294,13 +247,15 @@ bot.action("search", async (ctx) => {
     `Example:\n` +
     `Interstellar`,
     Markup.inlineKeyboard([
-      [Markup.button.callback("⬅️ Back", "home")]
+      [
+        Markup.button.callback("⬅️ Back", "home")
+      ]
     ])
   );
 });
 
 // ===============================
-// TO WATCH BUTTON
+// TO WATCH
 // ===============================
 
 bot.action("watch", async (ctx) => {
@@ -308,18 +263,75 @@ bot.action("watch", async (ctx) => {
 
   await ctx.editMessageText(
     `▶️ To Watch\n\n` +
-    `Send me the name of a movie.\n\n` +
-    `BFlix will search for legal viewing options.\n\n` +
-    `Example:\n` +
-    `Night of the Living Dead`,
+    `Send me the name of a movie or series.\n\n` +
+    `BFlix will show legal viewing options when available.`,
     Markup.inlineKeyboard([
-      [Markup.button.callback("⬅️ Back", "home")]
+      [
+        Markup.button.callback("⬅️ Back", "home")
+      ]
     ])
   );
 });
 
 // ===============================
-// TEXT SEARCH
+// AI SUPPORT
+// ===============================
+
+bot.action("help", async (ctx) => {
+  await ctx.answerCbQuery();
+
+  const userId = ctx.from.id;
+
+  aiSupportUsers.add(userId);
+  aiConversations.set(userId, []);
+
+  await ctx.editMessageText(
+    `🤖 BFlix AI Support\n\n` +
+    `Hi! I'm BFlix's AI support assistant.\n\n` +
+    `💬 Tell me what problem you're having and I'll help you.\n\n` +
+    `You can ask about:\n` +
+    `🔎 Search\n` +
+    `🎬 Movies\n` +
+    `📺 Series\n` +
+    `⭐ Favorites\n` +
+    `▶️ Watch options\n` +
+    `⚙️ Using BFlix`,
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback(
+          "🔙 Exit Support",
+          "exit_ai"
+        )
+      ]
+    ])
+  );
+});
+
+// ===============================
+// EXIT AI SUPPORT
+// ===============================
+
+bot.action("exit_ai", async (ctx) => {
+  await ctx.answerCbQuery();
+
+  const userId = ctx.from.id;
+
+  aiSupportUsers.delete(userId);
+  aiConversations.delete(userId);
+
+  await ctx.editMessageText(
+    `🎬 Welcome back to BFlix!\n\n` +
+    `🍿 Discover movies and series.\n` +
+    `🔎 Search your next title.\n` +
+    `▶️ Find legal watch options.\n` +
+    `🔥 Explore trending titles.\n` +
+    `⭐ Save your favorites.`,
+    mainMenu()
+  );
+});
+
+// ===============================
+// TEXT HANDLER
 // ===============================
 
 bot.on("text", async (ctx) => {
@@ -329,61 +341,167 @@ bot.on("text", async (ctx) => {
     return;
   }
 
+  const userId = ctx.from.id;
+
+  // =============================
+  // AI SUPPORT MODE
+  // =============================
+
+  if (aiSupportUsers.has(userId)) {
+    if (!openai) {
+      return ctx.reply(
+        `⚠️ BFlix AI Support is currently unavailable.\n\n` +
+        `Please try again later.`
+      );
+    }
+
+    try {
+      await ctx.sendChatAction("typing");
+
+      let history =
+        aiConversations.get(userId) || [];
+
+      history.push({
+        role: "user",
+        content: query
+      });
+
+      history = history.slice(-10);
+
+      const response =
+        await openai.responses.create({
+          model: "gpt-5.6-luna",
+
+          instructions:
+            `You are BFlix AI Support, the official support assistant for the BFlix Telegram bot.\n\n` +
+
+            `Help users with:\n` +
+            `- Searching movies and series\n` +
+            `- Movie and series details\n` +
+            `- Ratings and release dates\n` +
+            `- Legal watch options\n` +
+            `- Favorites\n` +
+            `- BFlix buttons and navigation\n` +
+            `- General BFlix usage\n\n` +
+
+            `Rules:\n` +
+            `- Reply in the same language as the user.\n` +
+            `- Be friendly and professional.\n` +
+            `- Keep answers concise but useful.\n` +
+            `- Never invent BFlix features.\n` +
+            `- Never provide piracy or illegal streaming sources.\n` +
+            `- Never reveal API keys, tokens, passwords or server secrets.\n` +
+            `- If you don't know something, say so honestly.`,
+
+          input: history
+        });
+
+      const answer =
+        response.output_text ||
+        "Sorry, I couldn't generate a response right now.";
+
+      history.push({
+        role: "assistant",
+        content: answer
+      });
+
+      aiConversations.set(
+        userId,
+        history.slice(-10)
+      );
+
+      await ctx.reply(
+        `🤖 ${answer}`,
+        Markup.inlineKeyboard([
+          [
+            Markup.button.callback(
+              "🔙 Exit Support",
+              "exit_ai"
+            )
+          ]
+        ])
+      );
+
+    } catch (error) {
+      console.error(
+        "OpenAI Support Error:",
+        error
+      );
+
+      await ctx.reply(
+        `❌ BFlix AI Support is temporarily unavailable.\n\n` +
+        `Please try again in a moment.`
+      );
+    }
+
+    return;
+  }
+
+  // =============================
+  // NORMAL SEARCH
+  // =============================
+
   if (!TMDB_API_KEY) {
     return ctx.reply(
-      "❌ TMDB API Key is not configured on the server."
+      "❌ TMDB API Key is not configured."
     );
   }
 
   try {
     await ctx.reply("🔎 Searching BFlix... 🍿");
 
-    const results = await searchTMDB(query);
+    const results =
+      await searchTMDB(query);
 
-    if (results.length === 0) {
+    if (!results.length) {
       return ctx.reply(
         `❌ No results found for "${query}".\n\n` +
         `Try another title.`
       );
     }
 
-    const limitedResults = results.slice(0, 10);
+    const limitedResults =
+      results.slice(0, 10);
 
-    const buttons = limitedResults.map((item) => {
-      const title =
-        item.media_type === "movie"
-          ? item.title
-          : item.name;
+    const buttons =
+      limitedResults.map((item) => {
+        const title =
+          item.media_type === "movie"
+            ? item.title
+            : item.name;
 
-      const year =
-        item.media_type === "movie"
-          ? item.release_date?.slice(0, 4)
-          : item.first_air_date?.slice(0, 4);
+        const year =
+          item.media_type === "movie"
+            ? item.release_date?.slice(0, 4)
+            : item.first_air_date?.slice(0, 4);
 
-      const type =
-        item.media_type === "movie"
-          ? "🎬"
-          : "📺";
+        const icon =
+          item.media_type === "movie"
+            ? "🎬"
+            : "📺";
 
-      return [
-        Markup.button.callback(
-          `${type} ${title}${year ? ` (${year})` : ""}`,
-          `tmdb_${item.media_type}_${item.id}`
-        )
-      ];
-    });
+        return [
+          Markup.button.callback(
+            `${icon} ${title}${year ? ` (${year})` : ""}`,
+            `tmdb_${item.media_type}_${item.id}`
+          )
+        ];
+      });
 
     await ctx.reply(
-      `🔎 Results for "${ctx.message.text}":`,
+      `🔎 Results for "${query}":`,
       Markup.inlineKeyboard(buttons)
     );
 
   } catch (error) {
-    console.error("TMDB Search Error:", error);
+    console.error(
+      "TMDB Search Error:",
+      error
+    );
 
     await ctx.reply(
-      "❌ An error occurred while searching.\n\n" +
-      "Please try again later."
+      `❌ Search failed.\n\n` +
+      `Please try again later.`
     );
   }
 });
@@ -392,273 +510,280 @@ bot.on("text", async (ctx) => {
 // MOVIE DETAILS
 // ===============================
 
-bot.action(/^tmdb_movie_(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-
-  try {
-    const movie = await getMovieDetails(ctx.match[1]);
-
-    const title = movie.title || "Unknown";
-
-    const year =
-      movie.release_date?.slice(0, 4) ||
-      "Unknown";
-
-    const rating = movie.vote_average
-      ? movie.vote_average.toFixed(1)
-      : "N/A";
-
-    const overview =
-      movie.overview ||
-      "No description available.";
-
-    const poster = movie.poster_path
-      ? `${TMDB_IMAGE_URL}${movie.poster_path}`
-      : null;
-
-    let watchButtons = [];
-
-    // =========================
-    // TMDB LEGAL PROVIDERS
-    // =========================
+bot.action(
+  /^tmdb_movie_(\d+)$/,
+  async (ctx) => {
+    await ctx.answerCbQuery();
 
     try {
-      const providerData =
-        await getWatchProviders("movie", movie.id);
+      const movie =
+        await getMovieDetails(ctx.match[1]);
 
-      const country =
-        providerData.results?.DZ ||
-        providerData.results?.IQ ||
-        providerData.results?.SA ||
-        providerData.results?.AE;
+      const title =
+        movie.title || "Unknown";
 
-      if (country?.link) {
-        watchButtons = buildWatchButtons(country);
+      const year =
+        movie.release_date?.slice(0, 4) ||
+        "Unknown";
 
-        if (watchButtons.length === 0) {
-          watchButtons.push([
-            Markup.button.url(
-              "▶️ Watch legally",
-              country.link
-            )
-          ]);
-        }
-      }
-    } catch (error) {
-      console.error(
-        "Watch Provider Error:",
-        error.message
-      );
-    }
+      const rating =
+        movie.vote_average
+          ? movie.vote_average.toFixed(1)
+          : "N/A";
 
-    // =========================
-    // INTERNET ARCHIVE
-    // =========================
+      const genres =
+        movie.genres?.map(
+          (genre) => genre.name
+        ).join(", ") || "N/A";
 
-    try {
-      const archiveResults =
-        await searchInternetArchive(title);
+      const overview =
+        movie.overview ||
+        "No description available.";
 
-      for (const result of archiveResults.slice(0, 3)) {
-        const video =
-          await getInternetArchiveVideo(
-            result.identifier
+      const runtime =
+        movie.runtime
+          ? `${movie.runtime} min`
+          : "N/A";
+
+      const poster =
+        movie.poster_path
+          ? `${TMDB_IMAGE_URL}${movie.poster_path}`
+          : null;
+
+      let watchButtons = [];
+
+      // Only Algeria
+      try {
+        const providerData =
+          await getWatchProviders(
+            "movie",
+            movie.id
           );
 
-        if (video) {
-          watchButtons.push([
-            Markup.button.url(
-              `▶️ Watch: ${result.title || title}`,
-              video.url
-            )
-          ]);
+        const country =
+          providerData.results?.DZ;
 
-          break;
+        if (country?.link) {
+          watchButtons =
+            buildWatchButtons(country);
+
+          if (!watchButtons.length) {
+            watchButtons.push([
+              Markup.button.url(
+                "▶️ Watch legally",
+                country.link
+              )
+            ]);
+          }
         }
+      } catch (error) {
+        console.error(
+          "Watch Provider Error:",
+          error.message
+        );
       }
+
+      if (!watchButtons.length) {
+        watchButtons.push([
+          Markup.button.url(
+            "🔎 Find legal options",
+            justWatchSearch(title)
+          )
+        ]);
+      }
+
+      const buttons = [
+        [
+          Markup.button.callback(
+            "⭐ Add to Favorites",
+            `tmdbfav_movie_${movie.id}`
+          )
+        ],
+        ...watchButtons,
+        [
+          Markup.button.callback(
+            "⬅️ Back",
+            "home"
+          )
+        ]
+      ];
+
+      const caption =
+        `🎬 ${title}\n\n` +
+        `📅 Release: ${year}\n` +
+        `⭐ Rating: ${rating}/10\n` +
+        `🎭 Genres: ${genres}\n` +
+        `⏱️ Runtime: ${runtime}\n\n` +
+        `📝 ${overview}\n\n` +
+        `🎞️ BFlix`;
+
+      if (poster) {
+        await ctx.replyWithPhoto(
+          { url: poster },
+          {
+            caption,
+            ...Markup.inlineKeyboard(buttons)
+          }
+        );
+      } else {
+        await ctx.reply(
+          caption,
+          Markup.inlineKeyboard(buttons)
+        );
+      }
+
     } catch (error) {
       console.error(
-        "Internet Archive Error:",
-        error.message
+        "Movie Details Error:",
+        error
       );
-    }
 
-    if (watchButtons.length === 0) {
-      watchButtons.push([
-        Markup.button.url(
-          "🔎 Find legal options",
-          `https://www.justwatch.com/search?q=${encodeURIComponent(title)}`
-        )
-      ]);
-    }
-
-    const buttons = [
-      [
-        Markup.button.callback(
-          "⭐ Add to Favorites",
-          `tmdbfav_movie_${movie.id}`
-        )
-      ],
-      ...watchButtons,
-      [
-        Markup.button.callback(
-          "⬅️ Back",
-          "home"
-        )
-      ]
-    ];
-
-    const caption =
-      `🎬 ${title}\n\n` +
-      `📅 Release: ${year}\n` +
-      `⭐ Rating: ${rating}/10\n\n` +
-      `📝 ${overview}\n\n` +
-      `🎞️ BFlix`;
-
-    if (poster) {
-      await ctx.replyWithPhoto(
-        { url: poster },
-        {
-          caption,
-          ...Markup.inlineKeyboard(buttons)
-        }
-      );
-    } else {
       await ctx.reply(
-        caption,
-        Markup.inlineKeyboard(buttons)
+        "❌ Couldn't load movie information."
       );
     }
-
-  } catch (error) {
-    console.error(
-      "Movie Details Error:",
-      error
-    );
-
-    await ctx.reply(
-      "❌ Couldn't load movie information."
-    );
   }
-});
+);
 
 // ===============================
 // TV DETAILS
 // ===============================
 
-bot.action(/^tmdb_tv_(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-
-  try {
-    const show = await getTVDetails(ctx.match[1]);
-
-    const title = show.name || "Unknown";
-
-    const year =
-      show.first_air_date?.slice(0, 4) ||
-      "Unknown";
-
-    const rating = show.vote_average
-      ? show.vote_average.toFixed(1)
-      : "N/A";
-
-    const overview =
-      show.overview ||
-      "No description available.";
-
-    const poster = show.poster_path
-      ? `${TMDB_IMAGE_URL}${show.poster_path}`
-      : null;
-
-    let watchButtons = [];
+bot.action(
+  /^tmdb_tv_(\d+)$/,
+  async (ctx) => {
+    await ctx.answerCbQuery();
 
     try {
-      const providerData =
-        await getWatchProviders("tv", show.id);
+      const show =
+        await getTVDetails(ctx.match[1]);
 
-      const country =
-        providerData.results?.DZ ||
-        providerData.results?.IQ ||
-        providerData.results?.SA ||
-        providerData.results?.AE;
+      const title =
+        show.name || "Unknown";
 
-      if (country?.link) {
-        watchButtons = buildWatchButtons(country);
+      const year =
+        show.first_air_date?.slice(0, 4) ||
+        "Unknown";
 
-        if (watchButtons.length === 0) {
-          watchButtons.push([
-            Markup.button.url(
-              "▶️ Watch legally",
-              country.link
-            )
-          ]);
+      const rating =
+        show.vote_average
+          ? show.vote_average.toFixed(1)
+          : "N/A";
+
+      const genres =
+        show.genres?.map(
+          (genre) => genre.name
+        ).join(", ") || "N/A";
+
+      const overview =
+        show.overview ||
+        "No description available.";
+
+      const seasons =
+        show.number_of_seasons || "N/A";
+
+      const episodes =
+        show.number_of_episodes || "N/A";
+
+      const poster =
+        show.poster_path
+          ? `${TMDB_IMAGE_URL}${show.poster_path}`
+          : null;
+
+      let watchButtons = [];
+
+      try {
+        const providerData =
+          await getWatchProviders(
+            "tv",
+            show.id
+          );
+
+        const country =
+          providerData.results?.DZ;
+
+        if (country?.link) {
+          watchButtons =
+            buildWatchButtons(country);
+
+          if (!watchButtons.length) {
+            watchButtons.push([
+              Markup.button.url(
+                "▶️ Watch legally",
+                country.link
+              )
+            ]);
+          }
         }
+      } catch (error) {
+        console.error(
+          "TV Provider Error:",
+          error.message
+        );
       }
+
+      if (!watchButtons.length) {
+        watchButtons.push([
+          Markup.button.url(
+            "🔎 Find legal options",
+            justWatchSearch(title)
+          )
+        ]);
+      }
+
+      const buttons = [
+        [
+          Markup.button.callback(
+            "⭐ Add to Favorites",
+            `tmdbfav_tv_${show.id}`
+          )
+        ],
+        ...watchButtons,
+        [
+          Markup.button.callback(
+            "⬅️ Back",
+            "home"
+          )
+        ]
+      ];
+
+      const caption =
+        `📺 ${title}\n\n` +
+        `📅 First aired: ${year}\n` +
+        `⭐ Rating: ${rating}/10\n` +
+        `🎭 Genres: ${genres}\n` +
+        `📚 Seasons: ${seasons}\n` +
+        `🎞️ Episodes: ${episodes}\n\n` +
+        `📝 ${overview}\n\n` +
+        `🎞️ BFlix`;
+
+      if (poster) {
+        await ctx.replyWithPhoto(
+          { url: poster },
+          {
+            caption,
+            ...Markup.inlineKeyboard(buttons)
+          }
+        );
+      } else {
+        await ctx.reply(
+          caption,
+          Markup.inlineKeyboard(buttons)
+        );
+      }
+
     } catch (error) {
       console.error(
-        "TV Provider Error:",
-        error.message
+        "TV Details Error:",
+        error
       );
-    }
 
-    if (watchButtons.length === 0) {
-      watchButtons.push([
-        Markup.button.url(
-          "🔎 Find legal options",
-          `https://www.justwatch.com/search?q=${encodeURIComponent(title)}`
-        )
-      ]);
-    }
-
-    const buttons = [
-      [
-        Markup.button.callback(
-          "⭐ Add to Favorites",
-          `tmdbfav_tv_${show.id}`
-        )
-      ],
-      ...watchButtons,
-      [
-        Markup.button.callback(
-          "⬅️ Back",
-          "home"
-        )
-      ]
-    ];
-
-    const caption =
-      `📺 ${title}\n\n` +
-      `📅 First aired: ${year}\n` +
-      `⭐ Rating: ${rating}/10\n\n` +
-      `📝 ${overview}\n\n` +
-      `🎞️ BFlix`;
-
-    if (poster) {
-      await ctx.replyWithPhoto(
-        { url: poster },
-        {
-          caption,
-          ...Markup.inlineKeyboard(buttons)
-        }
-      );
-    } else {
       await ctx.reply(
-        caption,
-        Markup.inlineKeyboard(buttons)
+        "❌ Couldn't load series information."
       );
     }
-
-  } catch (error) {
-    console.error(
-      "TV Details Error:",
-      error
-    );
-
-    await ctx.reply(
-      "❌ Couldn't load series information."
-    );
   }
-});
+);
 
 // ===============================
 // FAVORITES
@@ -677,7 +802,8 @@ bot.action(
       favorites.set(userId, []);
     }
 
-    const list = favorites.get(userId);
+    const list =
+      favorites.get(userId);
 
     const item =
       `${ctx.match[1]}_${ctx.match[2]}`;
@@ -701,7 +827,7 @@ bot.action("movies", async (ctx) => {
 
   await ctx.editMessageText(
     `🎬 Movies\n\n` +
-    `Search for any movie using TMDB.`,
+    `Search for any movie using BFlix.`,
     Markup.inlineKeyboard([
       [
         Markup.button.callback(
@@ -728,7 +854,7 @@ bot.action("series", async (ctx) => {
 
   await ctx.editMessageText(
     `📺 Series\n\n` +
-    `Search for any series using TMDB.`,
+    `Search for any series using BFlix.`,
     Markup.inlineKeyboard([
       [
         Markup.button.callback(
@@ -754,16 +880,38 @@ bot.action("genres", async (ctx) => {
   await ctx.answerCbQuery();
 
   await ctx.editMessageText(
-    `🎭 Explore Genres\n\n` +
-    `💥 Action\n` +
-    `😂 Comedy\n` +
-    `👻 Horror\n` +
-    `❤️ Romance\n` +
-    `🚀 Sci-Fi\n` +
-    `🕵️ Thriller\n` +
-    `🎭 Drama\n` +
-    `🧙 Fantasy`,
+    `🎭 Genres\n\nChoose a category:`,
     Markup.inlineKeyboard([
+      [
+        Markup.button.callback(
+          "😂 Comedy",
+          "genre_comedy"
+        ),
+        Markup.button.callback(
+          "💥 Action",
+          "genre_action"
+        )
+      ],
+      [
+        Markup.button.callback(
+          "👻 Horror",
+          "genre_horror"
+        ),
+        Markup.button.callback(
+          "❤️ Romance",
+          "genre_romance"
+        )
+      ],
+      [
+        Markup.button.callback(
+          "🚀 Sci-Fi",
+          "genre_scifi"
+        ),
+        Markup.button.callback(
+          "🕵️ Thriller",
+          "genre_thriller"
+        )
+      ],
       [
         Markup.button.callback(
           "⬅️ Back",
@@ -775,6 +923,82 @@ bot.action("genres", async (ctx) => {
 });
 
 // ===============================
+// GENRE SEARCH
+// ===============================
+
+const genreIds = {
+  comedy: 35,
+  action: 28,
+  horror: 27,
+  romance: 10749,
+  scifi: 878,
+  thriller: 53
+};
+
+bot.action(
+  /^genre_(comedy|action|horror|romance|scifi|thriller)$/,
+  async (ctx) => {
+    await ctx.answerCbQuery();
+
+    const genre =
+      ctx.match[1];
+
+    const genreId =
+      genreIds[genre];
+
+    try {
+      const url =
+        `${TMDB_BASE_URL}/discover/movie` +
+        `?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
+        `&with_genres=${genreId}` +
+        `&sort_by=popular      `&language=en-US`;
+
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        throw new Error(
+          `Genre error: ${response.status}`
+        );
+      }
+
+      const data = await response.json();
+
+      const results =
+        (data.results || []).slice(0, 10);
+
+      if (!results.length) {
+        return ctx.reply(
+          "❌ No movies found."
+        );
+      }
+
+      const buttons = results.map((movie) => [
+        Markup.button.callback(
+          `🎬 ${movie.title}` +
+            `${movie.release_date ? ` (${movie.release_date.slice(0, 4)})` : ""}`,
+          `tmdb_movie_${movie.id}`
+        )
+      ]);
+
+      await ctx.reply(
+        `🎭 ${genre.toUpperCase()} Movies`,
+        Markup.inlineKeyboard(buttons)
+      );
+
+    } catch (error) {
+      console.error(
+        "Genre Error:",
+        error
+      );
+
+      await ctx.reply(
+        "❌ Couldn't load this genre."
+      );
+    }
+  }
+);
+
+// ===============================
 // TRENDING
 // ===============================
 
@@ -783,14 +1007,15 @@ bot.action("trending", async (ctx) => {
 
   try {
     const url =
-      `${TMDB_BASE_URL}/trending/all/day` +
-      `?api_key=${encodeURIComponent(TMDB_API_KEY)}`;
+      `${TMDB_BASE_URL}/trending/all/week` +
+      `?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
+      `&language=en-US`;
 
     const response = await fetch(url);
 
     if (!response.ok) {
       throw new Error(
-        `TMDB error: ${response.status}`
+        `Trending error: ${response.status}`
       );
     }
 
@@ -805,41 +1030,36 @@ bot.action("trending", async (ctx) => {
         )
         .slice(0, 10);
 
-    if (results.length === 0) {
-      return ctx.editMessageText(
-        "🔥 No trending titles available.",
-        mainMenu()
-      );
-    }
-
     const buttons = results.map((item) => {
       const title =
         item.media_type === "movie"
           ? item.title
           : item.name;
 
+      const icon =
+        item.media_type === "movie"
+          ? "🎬"
+          : "📺";
+
       return [
         Markup.button.callback(
-          `${
-            item.media_type === "movie"
-              ? "🎬"
-              : "📺"
-          } ${title}`,
+          `${icon} ${title}`,
           `tmdb_${item.media_type}_${item.id}`
         )
       ];
     });
 
-    buttons.push([
-      Markup.button.callback(
-        "⬅️ Back",
-        "home"
-      )
-    ]);
-
     await ctx.editMessageText(
-      "🔥 Trending on TMDB",
-      Markup.inlineKeyboard(buttons)
+      `🔥 Trending This Week`,
+      Markup.inlineKeyboard([
+        ...buttons,
+        [
+          Markup.button.callback(
+            "⬅️ Back",
+            "home"
+          )
+        ]
+      ])
     );
 
   } catch (error) {
@@ -866,39 +1086,48 @@ bot.action("favorites", async (ctx) => {
   const list =
     favorites.get(userId) || [];
 
-  if (list.length === 0) {
+  if (!list.length) {
     return ctx.editMessageText(
-      "⭐ Your favorites are empty.",
-      mainMenu()
+      `⭐ Favorites\n\n` +
+      `You don't have any favorites yet.\n\n` +
+      `Open a movie or series and press ⭐ Add to Favorites.`,
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            "🔎 Search",
+            "search"
+          )
+        ],
+        [
+          Markup.button.callback(
+            "⬅️ Back",
+            "home"
+          )
+        ]
+      ])
     );
   }
 
+  const buttons =
+    list.slice(-20).map((item) => {
+      const [type, id] =
+        item.split("_");
+
+      return [
+        Markup.button.callback(
+          type === "movie"
+            ? `🎬 Movie #${id}`
+            : `📺 Series #${id}`,
+          `tmdb_${type}_${id}`
+        )
+      ];
+    });
+
   await ctx.editMessageText(
     `⭐ Your Favorites\n\n` +
-    `You have ${list.length} saved title(s).\n\n` +
-    `Favorites are currently stored temporarily.`,
-    mainMenu()
-  );
-});
-
-// ===============================
-// HELP
-// ===============================
-
-bot.action("help", async (ctx) => {
-  await ctx.answerCbQuery();
-
-  await ctx.editMessageText(
-    `ℹ️ BFlix Help\n\n` +
-    `🔎 Search — Find movies and series\n` +
-    `▶️ To Watch — Find legal watch options\n` +
-    `🎬 Movies — Movie section\n` +
-    `📺 Series — Series section\n` +
-    `🎭 Genres — Explore genres\n` +
-    `🔥 Trending — Trending titles\n` +
-    `⭐ Favorites — Save titles\n\n` +
-    `🎬 Enjoy BFlix!`,
+    `Saved titles: ${list.length}`,
     Markup.inlineKeyboard([
+      ...buttons,
       [
         Markup.button.callback(
           "⬅️ Back",
@@ -916,12 +1145,17 @@ bot.action("help", async (ctx) => {
 bot.action("home", async (ctx) => {
   await ctx.answerCbQuery();
 
+  const userId = ctx.from.id;
+
+  aiSupportUsers.delete(userId);
+  aiConversations.delete(userId);
+
   await ctx.editMessageText(
-    `🎬 Welcome to BFlix!\n\n` +
+    `🎬 Welcome back to BFlix!\n\n` +
     `🍿 Discover movies and series.\n` +
-    `🔎 Search your next movie.\n` +
+    `🔎 Search your next title.\n` +
     `▶️ Find legal watch options.\n` +
-    `🔥 Find what's trending.\n` +
+    `🔥 Explore trending titles.\n` +
     `⭐ Save your favorites.\n\n` +
     `✨ Enjoy your cinematic experience!`,
     mainMenu()
@@ -929,16 +1163,55 @@ bot.action("home", async (ctx) => {
 });
 
 // ===============================
-// WEB SERVER
+// /HELP
+// ===============================
+
+bot.help(async (ctx) => {
+  const userId = ctx.from.id;
+
+  aiSupportUsers.add(userId);
+  aiConversations.set(userId, []);
+
+  await ctx.reply(
+    `🤖 BFlix AI Support\n\n` +
+    `Tell me what you need help with and I'll assist you.`,
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback(
+          "🔙 Exit Support",
+          "exit_ai"
+        )
+      ]
+    ])
+  );
+});
+
+// ===============================
+// EXPRESS SERVER
 // ===============================
 
 app.get("/", (req, res) => {
-  res.send("🎬 BFlix Bot is online!");
+  res.send(
+    "🎬 BFlix Bot is running!"
+  );
 });
 
-app.listen(PORT, "0.0.0.0", () => {
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    bot: "BFlix",
+    ai: Boolean(openai),
+    tmdb: Boolean(TMDB_API_KEY)
+  });
+});
+
+// ===============================
+// START SERVER
+// ===============================
+
+app.listen(PORT, () => {
   console.log(
-    `BFlix server running on port ${PORT}`
+    `🌐 BFlix server running on port ${PORT}`
   );
 });
 
@@ -949,15 +1222,19 @@ app.listen(PORT, "0.0.0.0", () => {
 bot.launch()
   .then(() => {
     console.log(
-      "🎬 BFlix Bot started successfully!"
+      "🤖 BFlix bot started successfully!"
     );
   })
   .catch((error) => {
     console.error(
-      "Bot startup error:",
+      "❌ Bot launch error:",
       error
     );
   });
+
+// ===============================
+// GRACEFUL SHUTDOWN
+// ===============================
 
 process.once(
   "SIGINT",
