@@ -940,25 +940,105 @@ bot.action(
   async (ctx) => {
     await ctx.answerCbQuery();
 
-    const genre =
-      ctx.match[1];
+    const genre = ctx.match[1];
 
-    const genreId =
-      genreIds[genre];
+    const genreIds = {
+      comedy: 35,
+      action: 28,
+      horror: 27,
+      romance: 10749,
+      scifi: 878,
+      thriller: 53
+    };
+
+    const genreId = genreIds[genre];
+
+    if (!genreId) {
+      return ctx.reply("❌ Genre not found.");
+    }
 
     try {
       const url =
         `${TMDB_BASE_URL}/discover/movie` +
         `?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
         `&with_genres=${genreId}` +
-        `&sort_by=popular      `&language=en-US`;
+        `&sort_by=popularity.desc` +
+        `&language=en-US` +
+        `&page=1`;
 
       const response = await fetch(url);
 
       if (!response.ok) {
         throw new Error(
-          `Genre error: ${response.status}`
+          `TMDB Genre error: ${response.status}`
         );
+      }
+
+      const data = await response.json();
+
+      const results = data.results || [];
+
+      if (results.length === 0) {
+        return ctx.editMessageText(
+          "❌ No movies found for this genre.",
+          Markup.inlineKeyboard([
+            [
+              Markup.button.callback(
+                "⬅️ Back",
+                "home"
+              )
+            ]
+          ])
+        );
+      }
+
+      const buttons = results
+        .slice(0, 10)
+        .map((movie) => {
+          const year =
+            movie.release_date?.slice(0, 4) || "";
+
+          return [
+            Markup.button.callback(
+              `🎬 ${movie.title}${year ? ` (${year})` : ""}`,
+              `tmdb_movie_${movie.id}`
+            )
+          ];
+        });
+
+      buttons.push([
+        Markup.button.callback(
+          "⬅️ Back",
+          "home"
+        )
+      ]);
+
+      await ctx.editMessageText(
+        `🎭 ${genre.toUpperCase()} MOVIES\n\n` +
+        `🔥 Popular movies in this genre:`,
+        Markup.inlineKeyboard(buttons)
+      );
+
+    } catch (error) {
+      console.error(
+        "Genre Search Error:",
+        error
+      );
+
+      await ctx.editMessageText(
+        "❌ Couldn't load this genre right now.",
+        Markup.inlineKeyboard([
+          [
+            Markup.button.callback(
+              "⬅️ Back",
+              "home"
+            )
+          ]
+        ])
+      );
+    }
+  }
+);
       }
 
       const data = await response.json();
