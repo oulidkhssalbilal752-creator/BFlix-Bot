@@ -1,17 +1,19 @@
 const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
-const OpenAI = require("openai");
 
 const app = express();
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 const PORT = process.env.PORT || 10000;
 
 const TMDB_BASE = "https://api.themoviedb.org/3";
 const TMDB_IMAGE = "https://image.tmdb.org/t/p/w500";
+
+// ==============================
+// CHECK ENVIRONMENT VARIABLES
+// ==============================
 
 if (!BOT_TOKEN) {
   console.error("❌ BOT_TOKEN is missing");
@@ -25,10 +27,6 @@ if (!TMDB_API_KEY) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
-const openai = OPENAI_API_KEY
-  ? new OpenAI({ apiKey: OPENAI_API_KEY })
-  : null;
-
 // ==============================
 // WEB SERVER
 // ==============================
@@ -40,7 +38,8 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    bot: "BFlixBot"
+    bot: "BFlixBot",
+    tmdb: "connected"
   });
 });
 
@@ -97,7 +96,7 @@ function escapeHtml(text) {
 }
 
 // ==============================
-// SMART SEARCH NORMALIZATION
+// SEARCH NORMALIZATION
 // ==============================
 
 function normalizeTitle(text) {
@@ -115,17 +114,14 @@ function searchScore(query, title, item) {
 
   if (!q || !t) return 0;
 
-  // Exact match
   if (t === q) {
     return 1000;
   }
 
-  // Exact phrase at beginning
   if (t.startsWith(q)) {
     return 800;
   }
 
-  // Exact phrase somewhere
   if (t.includes(q)) {
     return 600;
   }
@@ -143,19 +139,17 @@ function searchScore(query, title, item) {
 
   let score = matched * 100;
 
-  // Prefer titles with similar length
   const lengthDifference = Math.abs(q.length - t.length);
 
   score -= Math.min(lengthDifference, 50);
 
-  // Small popularity bonus
   score += Math.min(item.popularity || 0, 50);
 
   return score;
 }
 
 // ==============================
-// SMART MOVIE / TV SEARCH
+// SMART SEARCH MOVIES + TV
 // ==============================
 
 async function smartSearch(query) {
@@ -183,7 +177,10 @@ async function smartSearch(query) {
     media_type: "tv"
   }));
 
-  const combined = [...movieResults, ...tvResults];
+  const combined = [
+    ...movieResults,
+    ...tvResults
+  ];
 
   const scored = combined.map(item => ({
     ...item,
@@ -208,7 +205,7 @@ async function smartSearch(query) {
 }
 
 // ==============================
-// MOVIE DETAILS
+// SEND MOVIE / TV DETAILS
 // ==============================
 
 async function sendMovie(ctx, item) {
@@ -239,17 +236,23 @@ async function sendMovie(ctx, item) {
       details.overview ||
       "No description available.";
 
+    const typeText =
+      type === "tv"
+        ? "TV Show"
+        : "Movie";
+
     let text =
       `🎬 <b>${escapeHtml(title)}</b>\n\n` +
       `⭐ Rating: <b>${rating}/10</b>\n` +
       `📅 Release: <b>${escapeHtml(date)}</b>\n` +
       `🎭 Genres: <b>${escapeHtml(genres)}</b>\n` +
-      `📺 Type: <b>${type === "tv" ? "TV Show" : "Movie"}</b>\n\n` +
+      `📺 Type: <b>${typeText}</b>\n\n` +
       `📖 <b>Overview</b>\n` +
       `${escapeHtml(overview)}`;
 
     const buttons = [];
 
+    // TMDB
     buttons.push([
       Markup.button.url(
         "🎬 Open on TMDB",
@@ -257,8 +260,9 @@ async function sendMovie(ctx, item) {
       )
     ]);
 
-    // Legal watch providers - US
+    // Legal watch providers - Algeria
     const providers =
+      details.watch_providers?.results?.DZ ||
       details.watch_providers?.results?.US;
 
     if (providers?.link) {
@@ -270,6 +274,7 @@ async function sendMovie(ctx, item) {
       ]);
     }
 
+    // Search again
     buttons.push([
       Markup.button.callback(
         "🔎 Search again",
@@ -297,8 +302,9 @@ async function sendMovie(ctx, item) {
         }
       );
     }
+
   } catch (error) {
-    console.error("Movie details error:", error);
+    console.error("❌ Movie details error:", error);
 
     await ctx.reply(
       "❌ Sorry, I couldn't load this title right now."
@@ -317,122 +323,35 @@ bot.start(async (ctx) => {
 🔎 Search for movies and TV shows.
 ⭐ Get ratings and detailed information.
 🔥 Discover trending titles.
-🎭 Browse popular genres.
-
-🤖 Need help? Use /help
+🎭 Browse popular movies.
 
 Just send me the name of a movie or TV show.`,
     {
       parse_mode: "HTML",
+
       ...Markup.inlineKeyboard([
         [
           Markup.button.callback(
             "🔎 Search",
             "SEARCH_AGAIN"
           ),
+
           Markup.button.callback(
             "🔥 Trending",
             "TRENDING"
           )
         ],
+
         [
           Markup.button.callback(
             "⭐ Popular",
             "POPULAR"
-          ),
-          Markup.button.callback(
-            "🤖 AI Help",
-            "AI_HELP"
           )
         ]
       ])
     }
   );
 });
-
-// ==============================
-// AI HELP
-// ==============================
-
-async function aiHelp(ctx) {
-  if (!openai) {
-    console.error(
-      "❌ OPENAI_API_KEY is missing"
-    );
-
-    return ctx.reply(
-      "🤖 AI Help is currently unavailable because the OpenAI API key is not configured."
-    );
-  }
-
-  try {
-    await ctx.sendChatAction("typing");
-
-    const response =
-      await openai.responses.create({
-        model: "gpt-5-mini",
-
-        input: `
-You are the AI assistant inside BFlix,
-a Telegram movie and TV show bot.
-
-Explain briefly and clearly how users can use BFlix.
-
-Mention that users can:
-- Search for movies and TV shows
-- View ratings
-- View release dates
-- View genres
-- Read descriptions
-- Find legal viewing options
-
-Reply in English.
-Be friendly.
-Use emojis.
-Keep the answer short.
-`
-      });
-
-    const answer =
-      response.output_text?.trim();
-
-    if (!answer) {
-      return ctx.reply(
-        "🤖 BFlix helps you discover movies and TV shows."
-      );
-    }
-
-    await ctx.reply(answer);
-
-  } catch (error) {
-    console.error(
-      "❌ OpenAI error:",
-      error
-    );
-
-    const status =
-      error?.status || "unknown";
-
-    console.error(
-      "OpenAI status:",
-      status
-    );
-
-    await ctx.reply(
-      "❌ AI Help is temporarily unavailable. Please try again later."
-    );
-  }
-}
-
-bot.help(aiHelp);
-
-bot.action(
-  "AI_HELP",
-  async (ctx) => {
-    await ctx.answerCbQuery();
-    await aiHelp(ctx);
-  }
-);
 
 // ==============================
 // TRENDING
@@ -446,11 +365,13 @@ async function trending(ctx) {
       await tmdb("/trending/all/day");
 
     const results =
-      data.results?.filter(
-        item =>
-          item.media_type === "movie" ||
-          item.media_type === "tv"
-      ).slice(0, 10) || [];
+      data.results
+        ?.filter(
+          item =>
+            item.media_type === "movie" ||
+            item.media_type === "tv"
+        )
+        .slice(0, 10) || [];
 
     if (!results.length) {
       return ctx.reply(
@@ -458,28 +379,23 @@ async function trending(ctx) {
       );
     }
 
-    let message =
-      "🔥 <b>Trending Today</b>\n\n";
-
-    results.forEach((item, index) => {
-      message +=
-        `${index + 1}. ` +
-        `<b>${escapeHtml(formatTitle(item))}</b>` +
-        ` ⭐ ${item.vote_average?.toFixed(1) || "N/A"}\n`;
-    });
+    const buttons = results.map(item => [
+      Markup.button.callback(
+        `${item.media_type === "tv" ? "📺" : "🎬"} ${formatTitle(item).slice(0, 45)}`,
+        `TITLE_${item.media_type}_${item.id}`
+      )
+    ]);
 
     await ctx.reply(
-      message,
+      "🔥 <b>Trending Today</b>\n\nChoose a title:",
       {
-        parse_mode: "HTML"
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard(buttons)
       }
     );
 
   } catch (error) {
-    console.error(
-      "Trending error:",
-      error
-    );
+    console.error("❌ Trending error:", error);
 
     await ctx.reply(
       "❌ Failed to load trending titles."
@@ -507,28 +423,23 @@ async function popular(ctx) {
       );
     }
 
-    let message =
-      "⭐ <b>Popular Movies</b>\n\n";
-
-    results.forEach((item, index) => {
-      message +=
-        `${index + 1}. ` +
-        `<b>${escapeHtml(formatTitle(item))}</b>` +
-        ` ⭐ ${item.vote_average?.toFixed(1) || "N/A"}\n`;
-    });
+    const buttons = results.map(item => [
+      Markup.button.callback(
+        `🎬 ${formatTitle(item).slice(0, 45)}`,
+        `TITLE_movie_${item.id}`
+      )
+    ]);
 
     await ctx.reply(
-      message,
+      "⭐ <b>Popular Movies</b>\n\nChoose a title:",
       {
-        parse_mode: "HTML"
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard(buttons)
       }
     );
 
   } catch (error) {
-    console.error(
-      "Popular error:",
-      error
-    );
+    console.error("❌ Popular error:", error);
 
     await ctx.reply(
       "❌ Failed to load popular movies."
@@ -614,10 +525,7 @@ bot.on("text", async (ctx) => {
     );
 
   } catch (error) {
-    console.error(
-      "Search error:",
-      error
-    );
+    console.error("❌ Search error:", error);
 
     await ctx.reply(
       "❌ Search failed. Please try again."
@@ -632,14 +540,10 @@ bot.on("text", async (ctx) => {
 bot.action(
   /^TITLE_(movie|tv)_(\d+)$/,
   async (ctx) => {
-
     await ctx.answerCbQuery();
 
-    const type =
-      ctx.match[1];
-
-    const id =
-      ctx.match[2];
+    const type = ctx.match[1];
+    const id = ctx.match[2];
 
     try {
       const data =
@@ -655,7 +559,7 @@ bot.action(
 
     } catch (error) {
       console.error(
-        "Title button error:",
+        "❌ Title button error:",
         error
       );
 
