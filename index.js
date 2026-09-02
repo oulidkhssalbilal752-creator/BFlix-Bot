@@ -2,32 +2,95 @@ const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
 
 const app = express();
+
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
 const PORT = process.env.PORT || 10000;
+const TMDB_API_KEY = process.env.TMDB_API_KEY;
+
+const TMDB_BASE_URL = "https://api.themoviedb.org/3";
+const TMDB_IMAGE_URL = "https://image.tmdb.org/t/p/w500";
 
 // ===============================
-// BFLIX MOVIE DATABASE
+// CHECK ENVIRONMENT VARIABLES
 // ===============================
 
-const movies = [
-  {
-    id: "movie1",
-    title: "Sample Movie",
-    year: "2026",
-    genre: "Action",
-    rating: "8.5",
-    description:
-      "A sample movie entry for your BFlix catalog.",
-    fileId: null
-  }
-];
+if (!process.env.BOT_TOKEN) {
+  console.error("❌ BOT_TOKEN is missing!");
+}
+
+if (!TMDB_API_KEY) {
+  console.error("❌ TMDB_API_KEY is missing!");
+}
 
 // ===============================
 // USER DATA
 // ===============================
 
 const favorites = new Map();
+
+// ===============================
+// TMDB SEARCH
+// ===============================
+
+async function searchTMDB(query) {
+  const url =
+    `${TMDB_BASE_URL}/search/multi` +
+    `?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
+    `&query=${encodeURIComponent(query)}` +
+    `&language=en-US` +
+    `&include_adult=false`;
+
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`TMDB API error: ${response.status}`);
+  }
+
+  const data = await response.json();
+
+  return (data.results || []).filter(
+    (item) => item.media_type === "movie" || item.media_type === "tv"
+  );
+}
+
+// ===============================
+// GET MOVIE DETAILS
+// ===============================
+
+async function getMovieDetails(id) {
+  const url =
+    `${TMDB_BASE_URL}/movie/${id}` +
+    `?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
+    `&language=en-US`;
+
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`TMDB movie error: ${response.status}`);
+  }
+
+  return await response.json();
+}
+
+// ===============================
+// GET TV DETAILS
+// ===============================
+
+async function getTVDetails(id) {
+  const url =
+    `${TMDB_BASE_URL}/tv/${id}` +
+    `?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
+    `&language=en-US`;
+
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`TMDB TV error: ${response.status}`);
+  }
+
+  return await response.json();
+}
 
 // ===============================
 // MAIN MENU
@@ -71,102 +134,223 @@ bot.start(async (ctx) => {
 });
 
 // ===============================
-// MOVIES
+// SEARCH BUTTON
 // ===============================
 
-bot.action("movies", async (ctx) => {
+bot.action("search", async (ctx) => {
   await ctx.answerCbQuery();
 
-  if (movies.length === 0) {
-    return ctx.editMessageText(
-      "🎬 No movies are available yet.",
-      mainMenu()
-    );
-  }
-
-  const buttons = movies.map((movie) => [
-    Markup.button.callback(
-      `🎬 ${movie.title}`,
-      `movie_${movie.id}`
-    )
-  ]);
-
-  buttons.push([
-    Markup.button.callback("⬅️ Back", "home")
-  ]);
-
   await ctx.editMessageText(
-    "🎬 Movies\n\nChoose a movie:",
-    Markup.inlineKeyboard(buttons)
+    `🔎 Search BFlix\n\n` +
+    `Send me the name of a movie or series.\n\n` +
+    `Example:\n` +
+    `Interstellar`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("⬅️ Back", "home")]
+    ])
   );
 });
 
 // ===============================
-// MOVIE DETAILS
+// TEXT SEARCH
 // ===============================
 
-bot.action(/^movie_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
+bot.on("text", async (ctx) => {
+  const query = ctx.message.text.trim();
 
-  const movie = movies.find((m) => m.id === ctx.match[1]);
+  if (!query || query.startsWith("/")) return;
 
-  if (!movie) {
-    return ctx.reply("❌ Movie not found.");
-  }
-
-  const buttons = [];
-
-  if (movie.fileId) {
-    buttons.push([
-      Markup.button.callback("▶️ Watch Movie", `watch_${movie.id}`)
-    ]);
-  }
-
-  buttons.push([
-    Markup.button.callback("⭐ Add to Favorites", `fav_${movie.id}`)
-  ]);
-
-  buttons.push([
-    Markup.button.callback("⬅️ Back to Movies", "movies")
-  ]);
-
-  await ctx.editMessageText(
-    `🎬 ${movie.title}\n\n` +
-    `📅 Year: ${movie.year}\n` +
-    `🎭 Genre: ${movie.genre}\n` +
-    `⭐ Rating: ${movie.rating}/10\n\n` +
-    `📝 ${movie.description}`,
-    Markup.inlineKeyboard(buttons)
-  );
-});
-
-// ===============================
-// WATCH MOVIE
-// ===============================
-
-bot.action(/^watch_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-
-  const movie = movies.find((m) => m.id === ctx.match[1]);
-
-  if (!movie || !movie.fileId) {
+  if (!TMDB_API_KEY) {
     return ctx.reply(
-      "🎬 This movie is not available for streaming yet."
+      "❌ TMDB API Key is not configured on the server."
     );
   }
 
-  await ctx.replyWithVideo(movie.fileId, {
-    caption:
-      `🎬 ${movie.title}\n\n` +
-      `Enjoy your movie on BFlix! 🍿`
-  });
+  try {
+    await ctx.reply("🔎 Searching TMDB... 🍿");
+
+    const results = await searchTMDB(query);
+
+    if (results.length === 0) {
+      return ctx.reply(
+        `❌ No results found for "${query}".\n\n` +
+        `Try another movie or series name.`
+      );
+    }
+
+    const limitedResults = results.slice(0, 10);
+
+    const buttons = limitedResults.map((item) => {
+      const title =
+        item.media_type === "movie"
+          ? item.title
+          : item.name;
+
+      const year =
+        item.media_type === "movie"
+          ? item.release_date?.slice(0, 4)
+          : item.first_air_date?.slice(0, 4);
+
+      const type =
+        item.media_type === "movie" ? "🎬" : "📺";
+
+      return [
+        Markup.button.callback(
+          `${type} ${title}${year ? ` (${year})` : ""}`,
+          `tmdb_${item.media_type}_${item.id}`
+        )
+      ];
+    });
+
+    await ctx.reply(
+      `🔎 Results for "${query}":`,
+      Markup.inlineKeyboard(buttons)
+    );
+
+  } catch (error) {
+    console.error("TMDB Search Error:", error);
+
+    await ctx.reply(
+      "❌ An error occurred while searching TMDB.\n\n" +
+      "Please try again later."
+    );
+  }
+});
+
+// ===============================
+// TMDB MOVIE DETAILS
+// ===============================
+
+bot.action(/^tmdb_movie_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+
+  try {
+    const movie = await getMovieDetails(ctx.match[1]);
+
+    const title = movie.title || "Unknown";
+    const year = movie.release_date?.slice(0, 4) || "Unknown";
+    const rating = movie.vote_average
+      ? movie.vote_average.toFixed(1)
+      : "N/A";
+
+    const overview =
+      movie.overview ||
+      "No description available.";
+
+    const poster = movie.poster_path
+      ? `${TMDB_IMAGE_URL}${movie.poster_path}`
+      : null;
+
+    const caption =
+      `🎬 ${title}\n\n` +
+      `📅 Release: ${year}\n` +
+      `⭐ Rating: ${rating}/10\n\n` +
+      `📝 ${overview}\n\n` +
+      `🎞️ BFlix`;
+
+    const buttons = Markup.inlineKeyboard([
+      [
+        Markup.button.callback(
+          "⭐ Add to Favorites",
+          `tmdbfav_movie_${movie.id}`
+        )
+      ],
+      [
+        Markup.button.callback("⬅️ Back", "home")
+      ]
+    ]);
+
+    if (poster) {
+      await ctx.replyWithPhoto(
+        { url: poster },
+        {
+          caption,
+          ...buttons
+        }
+      );
+    } else {
+      await ctx.reply(caption, buttons);
+    }
+
+  } catch (error) {
+    console.error("Movie Details Error:", error);
+
+    await ctx.reply(
+      "❌ Couldn't load movie information."
+    );
+  }
+});
+
+// ===============================
+// TMDB TV DETAILS
+// ===============================
+
+bot.action(/^tmdb_tv_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+
+  try {
+    const show = await getTVDetails(ctx.match[1]);
+
+    const title = show.name || "Unknown";
+    const year = show.first_air_date?.slice(0, 4) || "Unknown";
+
+    const rating = show.vote_average
+      ? show.vote_average.toFixed(1)
+      : "N/A";
+
+    const overview =
+      show.overview ||
+      "No description available.";
+
+    const poster = show.poster_path
+      ? `${TMDB_IMAGE_URL}${show.poster_path}`
+      : null;
+
+    const caption =
+      `📺 ${title}\n\n` +
+      `📅 First aired: ${year}\n` +
+      `⭐ Rating: ${rating}/10\n\n` +
+      `📝 ${overview}\n\n` +
+      `🎞️ BFlix`;
+
+    const buttons = Markup.inlineKeyboard([
+      [
+        Markup.button.callback(
+          "⭐ Add to Favorites",
+          `tmdbfav_tv_${show.id}`
+        )
+      ],
+      [
+        Markup.button.callback("⬅️ Back", "home")
+      ]
+    ]);
+
+    if (poster) {
+      await ctx.replyWithPhoto(
+        { url: poster },
+        {
+          caption,
+          ...buttons
+        }
+      );
+    } else {
+      await ctx.reply(caption, buttons);
+    }
+
+  } catch (error) {
+    console.error("TV Details Error:", error);
+
+    await ctx.reply(
+      "❌ Couldn't load series information."
+    );
+  }
 });
 
 // ===============================
 // FAVORITES
 // ===============================
 
-bot.action(/^fav_(.+)$/, async (ctx) => {
+bot.action(/^tmdbfav_(movie|tv)_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery("Added to favorites ⭐");
 
   const userId = ctx.from.id;
@@ -177,57 +361,34 @@ bot.action(/^fav_(.+)$/, async (ctx) => {
 
   const list = favorites.get(userId);
 
-  if (!list.includes(ctx.match[1])) {
-    list.push(ctx.match[1]);
+  const item = `${ctx.match[1]}_${ctx.match[2]}`;
+
+  if (!list.includes(item)) {
+    list.push(item);
   }
 
   await ctx.reply("⭐ Added to your favorites!");
 });
 
 // ===============================
-// FAVORITES MENU
+// MOVIES MENU
 // ===============================
 
-bot.action("favorites", async (ctx) => {
+bot.action("movies", async (ctx) => {
   await ctx.answerCbQuery();
 
-  const userId = ctx.from.id;
-  const list = favorites.get(userId) || [];
-
-  if (list.length === 0) {
-    return ctx.editMessageText(
-      "⭐ Your favorites are empty.\n\nAdd movies to your favorites to see them here.",
-      mainMenu()
-    );
-  }
-
-  const buttons = [];
-
-  list.forEach((id) => {
-    const movie = movies.find((m) => m.id === id);
-
-    if (movie) {
-      buttons.push([
-        Markup.button.callback(
-          `🎬 ${movie.title}`,
-          `movie_${movie.id}`
-        )
-      ]);
-    }
-  });
-
-  buttons.push([
-    Markup.button.callback("⬅️ Back", "home")
-  ]);
-
   await ctx.editMessageText(
-    "⭐ Your Favorites",
-    Markup.inlineKeyboard(buttons)
+    `🎬 Movies\n\n` +
+    `Use the Search button to find any movie from TMDB.`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("🔎 Search Movies", "search")],
+      [Markup.button.callback("⬅️ Back", "home")]
+    ])
   );
 });
 
 // ===============================
-// SERIES
+// SERIES MENU
 // ===============================
 
 bot.action("series", async (ctx) => {
@@ -235,9 +396,9 @@ bot.action("series", async (ctx) => {
 
   await ctx.editMessageText(
     `📺 Series\n\n` +
-    `Coming soon! 🚀\n\n` +
-    `BFlix is preparing the series section.`,
+    `Use the Search button to find any series from TMDB.`,
     Markup.inlineKeyboard([
+      [Markup.button.callback("🔎 Search Series", "search")],
       [Markup.button.callback("⬅️ Back", "home")]
     ])
   );
@@ -273,81 +434,88 @@ bot.action("genres", async (ctx) => {
 bot.action("trending", async (ctx) => {
   await ctx.answerCbQuery();
 
-  const trending = movies.slice(0, 5);
+  try {
+    const url =
+      `${TMDB_BASE_URL}/trending/all/day` +
+      `?api_key=${encodeURIComponent(TMDB_API_KEY)}`;
 
-  if (trending.length === 0) {
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error(`TMDB error: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    const results = (data.results || [])
+      .filter(
+        (item) =>
+          item.media_type === "movie" ||
+          item.media_type === "tv"
+      )
+      .slice(0, 10);
+
+    if (results.length === 0) {
+      return ctx.editMessageText(
+        "🔥 No trending titles available.",
+        mainMenu()
+      );
+    }
+
+    const buttons = results.map((item) => {
+      const title =
+        item.media_type === "movie"
+          ? item.title
+          : item.name;
+
+      return [
+        Markup.button.callback(
+          `${item.media_type === "movie" ? "🎬" : "📺"} ${title}`,
+          `tmdb_${item.media_type}_${item.id}`
+        )
+      ];
+    });
+
+    buttons.push([
+      Markup.button.callback("⬅️ Back", "home")
+    ]);
+
+    await ctx.editMessageText(
+      "🔥 Trending on TMDB",
+      Markup.inlineKeyboard(buttons)
+    );
+
+  } catch (error) {
+    console.error("Trending Error:", error);
+
+    await ctx.reply(
+      "❌ Couldn't load trending titles."
+    );
+  }
+});
+
+// ===============================
+// FAVORITES MENU
+// ===============================
+
+bot.action("favorites", async (ctx) => {
+  await ctx.answerCbQuery();
+
+  const userId = ctx.from.id;
+  const list = favorites.get(userId) || [];
+
+  if (list.length === 0) {
     return ctx.editMessageText(
-      "🔥 No trending titles available yet.",
+      "⭐ Your favorites are empty.",
       mainMenu()
     );
   }
 
-  const text =
-    "🔥 Trending on BFlix\n\n" +
-    trending
-      .map(
-        (movie, index) =>
-          `${index + 1}. 🎬 ${movie.title} — ⭐ ${movie.rating}`
-      )
-      .join("\n");
-
   await ctx.editMessageText(
-    text,
-    Markup.inlineKeyboard([
-      [Markup.button.callback("🎬 Browse Movies", "movies")],
-      [Markup.button.callback("⬅️ Back", "home")]
-    ])
-  );
-});
-
-// ===============================
-// SEARCH
-// ===============================
-
-bot.action("search", async (ctx) => {
-  await ctx.answerCbQuery();
-
-  await ctx.editMessageText(
-    `🔎 Search\n\n` +
-    `Send me the name of a movie or series.\n\n` +
-    `Example:\n` +
-    `Interstellar`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback("⬅️ Back", "home")]
-    ])
-  );
-});
-
-// ===============================
-// TEXT SEARCH
-// ===============================
-
-bot.on("text", async (ctx) => {
-  const query = ctx.message.text.toLowerCase().trim();
-
-  if (query.startsWith("/")) return;
-
-  const results = movies.filter((movie) =>
-    movie.title.toLowerCase().includes(query)
-  );
-
-  if (results.length === 0) {
-    return ctx.reply(
-      `🔎 No results found for "${ctx.message.text}".\n\n` +
-      `Try another title.`
-    );
-  }
-
-  const buttons = results.map((movie) => [
-    Markup.button.callback(
-      `🎬 ${movie.title}`,
-      `movie_${movie.id}`
-    )
-  ]);
-
-  await ctx.reply(
-    `🔎 Search results for "${ctx.message.text}":`,
-    Markup.inlineKeyboard(buttons)
+    `⭐ Your Favorites\n\n` +
+    `You have ${list.length} saved title(s).\n\n` +
+    `Favorites are currently stored temporarily.`,
+    mainMenu()
   );
 });
 
@@ -360,12 +528,12 @@ bot.action("help", async (ctx) => {
 
   await ctx.editMessageText(
     `ℹ️ BFlix Help\n\n` +
-    `🔎 Search — Find movies and series\n` +
-    `🎬 Movies — Browse movies\n` +
-    `📺 Series — Browse series\n` +
+    `🔎 Search — Find movies and series using TMDB\n` +
+    `🎬 Movies — Movie section\n` +
+    `📺 Series — Series section\n` +
     `🎭 Genres — Explore genres\n` +
-    `🔥 Trending — Popular titles\n` +
-    `⭐ Favorites — Save your favorite titles\n\n` +
+    `🔥 Trending — Trending titles\n` +
+    `⭐ Favorites — Save titles\n\n` +
     `🎬 Enjoy BFlix!`,
     Markup.inlineKeyboard([
       [Markup.button.callback("⬅️ Back", "home")]
@@ -374,7 +542,7 @@ bot.action("help", async (ctx) => {
 });
 
 // ===============================
-// HOME BUTTON
+// HOME
 // ===============================
 
 bot.action("home", async (ctx) => {
@@ -383,7 +551,7 @@ bot.action("home", async (ctx) => {
   await ctx.editMessageText(
     `🎬 Welcome to BFlix!\n\n` +
     `🍿 Discover movies and series.\n` +
-    `🔎 Search for your next movie.\n` +
+    `🔎 Search your next movie.\n` +
     `🎭 Explore genres.\n` +
     `🔥 Find what's trending.\n` +
     `⭐ Save your favorites.\n\n` +
@@ -393,7 +561,7 @@ bot.action("home", async (ctx) => {
 });
 
 // ===============================
-// RENDER WEB SERVER
+// WEB SERVER
 // ===============================
 
 app.get("/", (req, res) => {
